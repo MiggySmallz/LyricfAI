@@ -1,0 +1,8 @@
+node_modules
+npm-debug.log
+.env
+songs.csv
+/data
+
+index_old.js
+index_working.js

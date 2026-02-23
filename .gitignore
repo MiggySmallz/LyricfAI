@@ -1,0 +1,29 @@
+# Environment files (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Build outputs
+.output/
+.nuxt/
+.nitro/
+.cache/
+dist/
+
+# OS
+.DS_Store
+
+# Generated / runtime data
+render-api/data/
+nosana-song-to-lyric/data/
+render-api/songs.csv
+

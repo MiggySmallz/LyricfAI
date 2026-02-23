@@ -1,0 +1,14 @@
+# Generated pipeline output (audio + SRT files)
+data/
+
+# Local env files
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/

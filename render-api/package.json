@@ -1,0 +1,26 @@
+{
+  "name": "render-api",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@cross/kv": "npm:@jsr/cross__kv@^0.17.3",
+    "@nosana/sdk": "^0.4.25",
+    "axios": "^1.11.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "json2csv": "^6.0.0-alpha.2",
+    "p-queue": "^8.1.1",
+    "pg": "^8.16.3",
+    "pg-promise": "^12.0.0",
+    "ws": "^8.18.3"
+  }
+}
