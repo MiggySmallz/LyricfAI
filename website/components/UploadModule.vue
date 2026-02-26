@@ -30,10 +30,32 @@
               <p class="font-medium truncate">{{ item.title }}</p>
               <p class="text-sm truncate mb-3">By: {{ item.user.name }}</p>
               <img :src="item.artwork['150x150']" width="150" height="150" class="rounded-lg mx-auto">
-              <UButton class="mt-2" color="primary" variant="solid" @click="selectSong(item)" block>
-                <span v-if="loading !== item.id">Generate Lyrics</span>
-                <span v-else>Loading...</span>
+
+              <!-- Wallet connected: normal generate button -->
+              <UButton
+                v-if="connected"
+                class="mt-2"
+                color="primary"
+                variant="solid"
+                @click="selectSong(item)"
+                :loading="loading === item.id"
+                block
+              >
+                Generate Lyrics
               </UButton>
+
+              <!-- Wallet not connected: prompt to connect -->
+              <UTooltip v-else text="Connect your wallet first">
+                <UButton
+                  class="mt-2"
+                  color="neutral"
+                  variant="soft"
+                  disabled
+                  block
+                >
+                  Connect Wallet to Generate
+                </UButton>
+              </UTooltip>
             </div>
           </UCard>
         </UCarousel>
@@ -46,6 +68,8 @@
 import { ref } from "vue";
 
 const emit = defineEmits(["song-selected"]);
+
+const { connected } = useWallet();
 
 const searchedSong = ref("");
 const loading = ref("");

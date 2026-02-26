@@ -27,14 +27,20 @@ def err(msg: str):
     print(f"[ERROR] {msg}", flush=True, file=sys.stderr)
 
 
-def download_to(path: str, url: str, retries: int = 2):
+def download_to(path: str, url: str, retries: int = 5):
+    # Audius creator nodes reject non-browser user-agents
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "audio/webm,audio/ogg,audio/wav,audio/*;q=0.9,*/*;q=0.5",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://audius.co/",
+    }
     attempts = 0
 
     while attempts < retries:
         try:
             print(f"Downloading: {url}")
-            # connect_timeout=30s, read_timeout=300s
-            with requests.get(url, stream=True, timeout=(300, 300)) as r:
+            with requests.get(url, stream=True, timeout=(300, 300), headers=headers) as r:
                 r.raise_for_status()
                 with open(path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=8192):
@@ -46,10 +52,10 @@ def download_to(path: str, url: str, retries: int = 2):
             err(e)
             attempts += 1
             if attempts < retries:
-                print(f"[INFO] Retrying in 10s...")
-                time.sleep(10)
-            
-    err(f"Failed to download {url} after {retries} attempts")
+                print(f"[INFO] Retrying in 15s... (attempt {attempts}/{retries})")
+                time.sleep(15)
+
+    raise RuntimeError(f"Failed to download {url} after {retries} attempts")
 
 
 def run_demucs(input_audio: str, out_dir: str, model: str, two_stems: str | None, shifts: int, overlap: float, jobs: int):

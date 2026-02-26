@@ -2,7 +2,10 @@
   <UContainer>
     <header class="flex justify-between items-center py-4 border-b">
       <h1 class="text-2xl font-bold text-primary">LyricfAI</h1>
-      <UTabs v-model="activeTab" :items="tabs" />
+      <div class="flex items-center gap-4">
+        <UTabs v-model="activeTab" :items="tabs" />
+        <WalletButton />
+      </div>
     </header>
 
     <main class="flex-grow py-8">
@@ -28,8 +31,10 @@
 import { ref, onMounted, onBeforeUnmount } from 'vue';
 import UploadModule from './components/UploadModule.vue';
 import SongList from './components/SongList.vue';
+import WalletButton from './components/WalletButton.vue';
 
 const apiUrl = import.meta.env.VITE_API_URL;
+const { publicKey, signAndSend } = useWallet();
 
 const tabs = [
   { label: 'Upload Song', value: 'upload' },
@@ -66,7 +71,7 @@ onBeforeUnmount(() => {
 
 // Called by UploadModule when the user clicks Generate Lyrics
 async function addSong(audiusSong) {
-  // Build and save the entry immediately so it appears in history right away
+  // Optimistically add a placeholder entry so the UI updates immediately
   const tempID = `pending-${Date.now()}`;
   const newEntry = {
     jobID: tempID,
@@ -83,26 +88,51 @@ async function addSong(audiusSong) {
   history.value = current;
   activeTab.value = "history";
 
-  // Fetch the real jobID from the API (app.vue stays mounted, so this always completes)
   try {
-    const response = await fetch(`${apiUrl}/songurl`, {
+    // 1. Ask backend to build the partially-signed Nosana job transaction
+    const buildRes = await fetch(`${apiUrl}/buildJobTx`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ selectedSongID: audiusSong.id }),
+      body: JSON.stringify({
+        userPublicKey: publicKey.value,
+        selectedSongID: audiusSong.id,
+        songTitle: audiusSong.title,
+        artistName: audiusSong.user?.name || "",
+      }),
     });
-    const result = await response.json();
+    if (!buildRes.ok) {
+      const { error } = await buildRes.json();
+      throw new Error(error || "Failed to build transaction");
+    }
+    const { base64tx, jobID } = await buildRes.json();
 
-    // Replace the temp placeholder with the real jobID
+    // 2. Ask the wallet to sign and broadcast the transaction
+    const txSignature = await signAndSend(base64tx);
+    console.log("Transaction broadcast:", txSignature);
+
+    // 3. Tell the backend the job is live
+    await fetch(`${apiUrl}/registerJob`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jobID, txSignature }),
+    });
+
+    // 4. Replace the temp placeholder with the real jobID
     const songs = JSON.parse(localStorage.getItem("songHistory") || "[]");
     const idx = songs.findIndex(s => s.jobID === tempID);
     if (idx !== -1) {
-      songs[idx].jobID = result.jobID;
+      songs[idx].jobID = jobID;
       localStorage.setItem("songHistory", JSON.stringify(songs));
       history.value = songs;
     }
-    tryOpenWSForJob(result.jobID);
+    tryOpenWSForJob(jobID);
   } catch (err) {
-    console.error("Error posting /songurl:", err);
+    console.error("Error submitting job:", err);
+    // Remove the optimistic placeholder on failure
+    const songs = JSON.parse(localStorage.getItem("songHistory") || "[]");
+    const cleaned = songs.filter(s => s.jobID !== tempID);
+    localStorage.setItem("songHistory", JSON.stringify(cleaned));
+    history.value = cleaned;
   }
 }
 

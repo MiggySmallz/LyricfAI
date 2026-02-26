@@ -1,7 +1,10 @@
 // index.js
 
-import { PublicKey } from "@solana/web3.js";
+import { PublicKey, Transaction, Keypair } from "@solana/web3.js";
+import { getAssociatedTokenAddress } from "@solana/spl-token";
+import * as anchor from "@coral-xyz/anchor";
 import { Client } from "@nosana/sdk";
+const { BN } = anchor.default ?? anchor;
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -77,7 +80,7 @@ app.get("/", (req, res) => {
 
 // POST /songurl
 app.post("/songurl", async (req, res) => {
-  const { selectedSongID } = req.body;
+  const { selectedSongID, songTitle, artistName } = req.body;
   if (!selectedSongID) return res.status(400).json({ error: "selectedSongID required" });
 
   try {
@@ -119,7 +122,7 @@ app.post("/songurl", async (req, res) => {
                 "--output_dir", "/data/output",
                 "--jobID", jobID,
               ],
-              image: "docker.io/miggysmallz/nosana-song-to-lyric:v1.0.0",
+              image: "docker.io/miggysmallz/nosana-song-to-lyric:v1.0.1",
               gpu: true,
             },
           },
@@ -159,6 +162,8 @@ app.post("/songurl", async (req, res) => {
       const placeholder = {
         jobID,
         songUrl,
+        songTitle: songTitle || "",
+        artistName: artistName || "",
         lyrics: "",
         createdAt: new Date().toISOString(),
         status: "processing",
@@ -178,6 +183,122 @@ app.post("/songurl", async (req, res) => {
     console.error("Error submitting job:", err);
     res.status(500).json({ error: "Failed to submit job" });
   }
+});
+
+// POST /buildJobTx — build a Nosana job tx for the user's wallet to sign & broadcast
+app.post("/buildJobTx", async (req, res) => {
+  const { userPublicKey, selectedSongID, songTitle, artistName } = req.body;
+  if (!userPublicKey || !selectedSongID) {
+    return res.status(400).json({ error: "userPublicKey and selectedSongID required" });
+  }
+
+  let userPubkey;
+  try {
+    userPubkey = new PublicKey(userPublicKey);
+  } catch {
+    return res.status(400).json({ error: "Invalid userPublicKey" });
+  }
+
+  try {
+    const songUrl = `https://api.audius.co/v1/tracks/${selectedSongID}/stream`;
+    const jobID = uuidv4();
+
+    const json_flow = {
+      version: "0.1",
+      type: "container",
+      meta: { trigger: "cli" },
+      ops: [{
+        type: "container/run",
+        id: "demucs-whisper",
+        args: {
+          cmd: ["--url", songUrl, "--output_dir", "/data/output", "--jobID", jobID],
+          image: "docker.io/miggysmallz/nosana-song-to-lyric:v1.0.1",
+          gpu: true,
+        },
+      }],
+    };
+
+    const ipfsHash = await nosana.ipfs.pin(json_flow);
+    console.log(`IPFS uploaded: ${nosana.ipfs.config.gateway}${ipfsHash}`);
+
+    // Load SDK internals (cached after first call)
+    await nosana.jobs.loadNosanaJobs();
+    await nosana.jobs.setAccounts();
+
+    const mint = new PublicKey(nosana.jobs.config.nos_address);
+    const market = new PublicKey(process.env.MARKET);
+
+    // Generate ephemeral keypairs the Nosana program requires
+    const jobKey = Keypair.generate();
+    const runKey = Keypair.generate();
+
+    // Build accounts with user as payer + authority (user owns their job)
+    const pda = (seeds, programId) => PublicKey.findProgramAddressSync(seeds, programId)[0];
+    const accounts = {
+      ...nosana.jobs.accounts,
+      job: jobKey.publicKey,
+      run: runKey.publicKey,
+      user: await getAssociatedTokenAddress(mint, userPubkey),
+      payer: userPubkey,
+      market,
+      authority: userPubkey,
+      vault: pda([market.toBuffer(), mint.toBuffer()], nosana.jobs.jobs.programId),
+    };
+
+    // Build the Anchor instruction without signing
+    const { bs58: anchorBs58 } = await import("@coral-xyz/anchor/dist/cjs/utils/bytes/index.js");
+    const ix = await nosana.jobs.jobs.methods
+      .list([...anchorBs58.decode(ipfsHash).subarray(2)], new BN(3600))
+      .accounts(accounts)
+      .instruction();
+
+    // Wrap in a legacy Transaction
+    const { blockhash, lastValidBlockHeight } = await nosana.jobs.connection.getLatestBlockhash();
+    const tx = new Transaction();
+    tx.feePayer = userPubkey;
+    tx.recentBlockhash = blockhash;
+    tx.add(ix);
+
+    // Partially sign with the ephemeral keypairs
+    tx.partialSign(jobKey, runKey);
+
+    const base64tx = tx.serialize({ requireAllSignatures: false }).toString("base64");
+
+    // Persist as pending until user confirms
+    await state.db.set(["songs", jobID], {
+      jobID,
+      songUrl,
+      songTitle: songTitle || "",
+      artistName: artistName || "",
+      lyrics: "",
+      createdAt: new Date().toISOString(),
+      status: "pending_signature",
+      nosanaJob: jobKey.publicKey.toBase58(),
+    });
+
+    res.json({ base64tx, jobID, nosanaJob: jobKey.publicKey.toBase58(), lastValidBlockHeight });
+  } catch (err) {
+    console.error("Error building job tx:", err);
+    res.status(500).json({ error: "Failed to build job transaction" });
+  }
+});
+
+// POST /registerJob — called by frontend after user signs & broadcasts
+app.post("/registerJob", async (req, res) => {
+  const { jobID, txSignature } = req.body;
+  if (!jobID) return res.status(400).json({ error: "jobID required" });
+
+  const record = await kvGetSong(jobID);
+  if (!record) return res.status(404).json({ error: "Job not found" });
+
+  await state.db.set(["songs", jobID], {
+    ...record,
+    status: "processing",
+    txSignature: txSignature || null,
+  });
+
+  console.log(`Job ${jobID} registered as processing (tx: ${txSignature})`);
+  res.json({ status: "ok" });
 });
 
 // POST /addSong
@@ -226,7 +347,7 @@ function timeStrToSeconds(timeStr) {
   return hh * 3600 + mm * 60 + ss + parseInt(ms, 10) / 1000;
 }
 
-function parseSRTtoRows(srtText, jobID, songUrl) {
+function parseSRTtoRows(srtText, jobID, songUrl, songTitle = "", artistName = "", nosanaJob = "") {
   if (!srtText) return [];
   srtText = srtText.replace(/\\n/g, "\n");
   const blocks = srtText.split(/\n\s*\n/).filter(Boolean);
@@ -236,25 +357,14 @@ function parseSRTtoRows(srtText, jobID, songUrl) {
     const [startStr, endStr] = lines[1].split("-->").map(s => s.trim());
     return [{
       jobID,
+      title: songTitle,
+      artist: artistName,
       song_url: songUrl,
+      nosana_job: nosanaJob,
       start: timeStrToSeconds(startStr),
       end: timeStrToSeconds(endStr),
       lyrics: lines.slice(2).join(" ").trim(),
     }];
-  });
-}
-
-function parseSRTtoSegments(srtText) {
-  if (!srtText) return [];
-  srtText = srtText.replace(/\\n/g, "\n");
-  const blocks = srtText.split(/\n\s*\n/).filter(Boolean);
-  return blocks.flatMap(block => {
-    const lines = block.split("\n").filter(Boolean);
-    if (lines.length < 2 || !lines[1].includes("-->")) return [];
-    const [startStr, endStr] = lines[1].split("-->").map(s => s.trim());
-    const lyrics = lines.slice(2).join(" ").trim();
-    if (!lyrics) return [];
-    return [{ start: timeStrToSeconds(startStr), end: timeStrToSeconds(endStr), lyrics }];
   });
 }
 
@@ -280,7 +390,7 @@ app.get("/downloadCSV", async (req, res) => {
   }
 });
 
-// GET /exportForEffect — one row per song with segments as JSON, ready to submit to Effect AI
+// GET /exportForEffect — one row per SRT segment, ready to submit to Effect AI
 app.get("/exportForEffect", async (req, res) => {
   try {
     const allSongs = await kvListAllSongs();
@@ -290,13 +400,11 @@ app.get("/exportForEffect", async (req, res) => {
 
     if (!readySongs.length) return res.json({ status: 204, songs: [] });
 
-    const rows = readySongs.map(song => ({
-      song_url: song.songUrl,
-      jobID: song.jobID,
-      segments: JSON.stringify(parseSRTtoSegments(song.lyrics)),
-    }));
+    const rows = readySongs.flatMap(song =>
+      parseSRTtoRows(song.lyrics, song.jobID, song.songUrl, song.songTitle, song.artistName, song.nosanaJob)
+    );
 
-    const parser = new Parser({ fields: ["song_url", "jobID", "segments"] });
+    const parser = new Parser({ fields: ["jobID", "title", "artist", "song_url", "nosana_job", "start", "end", "lyrics"] });
     const csv = parser.parse(rows);
 
     res.setHeader("Content-Type", "text/csv");
