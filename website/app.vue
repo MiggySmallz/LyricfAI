@@ -1,4 +1,5 @@
 <template>
+  <UApp>
   <UContainer>
     <header class="flex justify-between items-center py-4 border-b">
       <h1 class="text-2xl font-bold text-primary">LyricfAI</h1>
@@ -20,6 +21,7 @@
         v-if="activeTab === 'history'"
         :history="history"
         @delete-song="deleteSong"
+        @retry-song="retrySong"
       />
     </main>
 
@@ -27,6 +29,7 @@
       2025 LyricfAI ~ An Effect AI project.
     </footer>
   </UContainer>
+  </UApp>
 </template>
 
 <script setup>
@@ -78,10 +81,12 @@ async function addSong(audiusSong) {
   const newEntry = {
     jobID: tempID,
     name: audiusSong.title,
+    artistName: audiusSong.user?.name || "",
     cover: audiusSong.artwork?.["150x150"] || "",
     audio: `https://api.audius.co/v1/tracks/${audiusSong.id}/stream`,
     songID: audiusSong.id,
     date: new Date().toLocaleDateString(),
+    createdAt: new Date().toISOString(),
     lyrics: "",
   };
   const current = JSON.parse(localStorage.getItem("songHistory") || "[]");
@@ -106,7 +111,7 @@ async function addSong(audiusSong) {
       const { error } = await buildRes.json();
       throw new Error(error || "Failed to build transaction");
     }
-    const { base64tx, jobID } = await buildRes.json();
+    const { base64tx, jobID, nosanaJob } = await buildRes.json();
 
     // 2. Ask the wallet to sign and broadcast the transaction
     const txSignature = await signAndSend(base64tx);
@@ -119,11 +124,12 @@ async function addSong(audiusSong) {
       body: JSON.stringify({ jobID, txSignature }),
     });
 
-    // 4. Replace the temp placeholder with the real jobID
+    // 4. Replace the temp placeholder with the real jobID and nosanaJob
     const songs = JSON.parse(localStorage.getItem("songHistory") || "[]");
     const idx = songs.findIndex(s => s.jobID === tempID);
     if (idx !== -1) {
       songs[idx].jobID = jobID;
+      if (nosanaJob) songs[idx].nosanaJob = nosanaJob;
       localStorage.setItem("songHistory", JSON.stringify(songs));
       history.value = songs;
     }
@@ -136,6 +142,27 @@ async function addSong(audiusSong) {
     localStorage.setItem("songHistory", JSON.stringify(cleaned));
     history.value = cleaned;
   }
+}
+
+// Called by SongList when the user clicks the Retry button on a failed song
+async function retrySong(song) {
+  // Close any existing WebSocket for the old job
+  if (song.jobID && wsMap.has(song.jobID)) {
+    try { wsMap.get(song.jobID).close(); } catch {}
+    wsMap.delete(song.jobID);
+  }
+  // Remove the stale entry so addSong starts fresh
+  const songs = JSON.parse(localStorage.getItem("songHistory") || "[]");
+  const cleaned = songs.filter(s => s.jobID !== song.jobID);
+  localStorage.setItem("songHistory", JSON.stringify(cleaned));
+  history.value = cleaned;
+  // Re-submit using the stored song data
+  await addSong({
+    id: song.songID,
+    title: song.name,
+    artwork: { "150x150": song.cover },
+    user: { name: song.artistName || "" },
+  });
 }
 
 // Called by SongList when the user clicks the delete button

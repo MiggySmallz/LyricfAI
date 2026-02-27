@@ -16,6 +16,7 @@ import PQueue from "p-queue";
 import * as state from "./state.js";
 import http from "http";
 import { WebSocketServer } from "ws";
+import axios from "axios";
 
 dotenv.config();
 
@@ -437,6 +438,59 @@ app.get("/exportForEffect", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to export songs for Effect AI" });
+  }
+});
+
+// POST /postToEffect — import ready lyrics into an existing Effect AI fetcher
+app.post("/postToEffect", async (req, res) => {
+  const { authKey, datasetId, fetcherIndex } = req.body;
+
+  const effectUrl = process.env.EFFECT_URL;
+  if (!effectUrl) return res.status(500).json({ error: "EFFECT_URL not configured on server" });
+  if (!authKey || !datasetId || fetcherIndex === undefined) {
+    return res.status(400).json({ error: "authKey, datasetId, and fetcherIndex are required" });
+  }
+
+  try {
+    // 1. Build CSV (same logic as /exportForEffect)
+    const allSongs = await kvListAllSongs();
+    const readySongs = allSongs.map(s => s.data).filter(d => d?.status === "ready" && d?.lyrics);
+    if (!readySongs.length) return res.status(400).json({ error: "No ready songs to export" });
+
+    const rows = readySongs.flatMap(song =>
+      parseSRTtoRows(song.lyrics, song.jobID, song.songUrl, song.songTitle, song.artistName, song.nosanaJob)
+    );
+    const parser = new Parser({ fields: ["jobID", "title", "artist", "song_url", "nosana_job", "start", "end", "lyrics"] });
+    const csv = parser.parse(rows);
+
+    // 2. Authenticate with task-poster (cookie session)
+    const authRes = await axios.post(
+      `${effectUrl}/auth`,
+      new URLSearchParams({ key: authKey }).toString(),
+      {
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        maxRedirects: 5,
+        validateStatus: s => s < 500,
+      }
+    );
+    const setCookie = authRes.headers["set-cookie"];
+    if (!setCookie || !setCookie.length) {
+      return res.status(401).json({ error: "Effect AI auth failed — check authKey" });
+    }
+    const cookie = setCookie[0].split(";")[0];
+
+    // 3. Import CSV into the existing fetcher
+    await axios.post(
+      `${effectUrl}/d/${datasetId}/f/${fetcherIndex}/import`,
+      new URLSearchParams({ csv, delimiter: "," }).toString(),
+      { headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded" } }
+    );
+
+    res.json({ status: "ok", datasetId, fetcherIndex, taskCount: rows.length });
+  } catch (err) {
+    const detail = err?.response?.data || err?.message || String(err);
+    console.error("postToEffect error:", detail);
+    res.status(500).json({ error: "Failed to post to Effect AI", detail: String(detail) });
   }
 });
 

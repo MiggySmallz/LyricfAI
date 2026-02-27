@@ -34,17 +34,101 @@
               v-model="showLyrics"
               :song="song"
             />
-            <p v-if="!song.lyrics" class="text-sm italic text-gray-400">Lyrics Pending...</p>
-            <p v-else class="text-sm italic text-green-400">Lyrics Complete</p>
+            <template v-if="song.lyrics">
+              <p class="text-sm italic text-green-400">Lyrics Complete</p>
+            </template>
+            <template v-else-if="isFailed(song)">
+              <p class="text-sm italic text-red-400">Generation failed</p>
+              <UButton size="xs" color="primary" variant="soft" icon="i-heroicons-arrow-path" @click="$emit('retry-song', song)">
+                Retry
+              </UButton>
+            </template>
+            <template v-else>
+              <p class="text-sm italic text-gray-400">Lyrics Pending...</p>
+            </template>
+            <a
+              v-if="song.nosanaJob"
+              :href="`https://dashboard.nosana.com/jobs/${song.nosanaJob}`"
+              target="_blank"
+              rel="noopener noreferrer"
+              class="text-xs text-primary-400 hover:underline mt-1"
+            >
+              View on Nosana ↗
+            </a>
           </div>
         </div>
       </UCard>
     </div>
+
+    <!-- Effect AI campaign poster -->
+    <UCard class="mt-6">
+      <h3 class="text-base font-semibold mb-4">Post to Effect AI</h3>
+
+      <div class="grid grid-cols-2 gap-4">
+        <div class="space-y-1">
+          <label class="block text-sm font-medium">Dataset ID</label>
+          <input
+            v-model="effectForm.datasetId"
+            class="w-full rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+            placeholder="e.g. 645649141271743"
+          />
+        </div>
+
+        <div class="space-y-1">
+          <label class="block text-sm font-medium">Fetcher index</label>
+          <input
+            v-model.number="effectForm.fetcherIndex"
+            type="number"
+            min="0"
+            step="1"
+            class="w-full rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+            placeholder="e.g. 1"
+          />
+        </div>
+
+        <div class="col-span-2 space-y-1">
+          <label class="block text-sm font-medium">Auth key</label>
+          <input
+            v-model="effectForm.authKey"
+            type="password"
+            class="w-full rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+            placeholder="Task-poster password"
+          />
+        </div>
+      </div>
+
+      <div v-if="effectResult" class="mt-4 rounded-md bg-green-50 dark:bg-green-900/20 p-3 text-sm text-green-700 dark:text-green-300">
+        Campaign created! Dataset ID: <strong>{{ effectResult.datasetId }}</strong> · {{ effectResult.taskCount }} tasks queued.
+      </div>
+
+      <div v-if="effectError" class="mt-4 rounded-md bg-red-50 dark:bg-red-900/20 p-3 text-sm text-red-700 dark:text-red-300">
+        {{ effectError }}
+      </div>
+
+      <div class="mt-4 flex justify-end">
+        <UButton
+          color="primary"
+          icon="i-heroicons-cloud-arrow-up"
+          :loading="effectPosting"
+          :disabled="!effectForm.datasetId || !effectForm.authKey"
+          @click="postToEffect"
+        >
+          Post campaign
+        </UButton>
+      </div>
+    </UCard>
   </section>
 </template>
 
 <script setup>
-import { ref } from "vue";
+import { ref, reactive } from "vue";
+
+// Songs with no lyrics that were submitted more than 30 minutes ago are considered failed
+const FAILURE_TIMEOUT_MS = 30 * 60 * 1000;
+function isFailed(song) {
+  if (song.lyrics || song.jobID?.startsWith("pending-") || !song.createdAt) return false;
+  return Date.now() - new Date(song.createdAt).getTime() > FAILURE_TIMEOUT_MS;
+}
 
 const apiUrl = import.meta.env.VITE_API_URL;
 
@@ -55,9 +139,18 @@ defineProps({
   },
 });
 
-defineEmits(["delete-song"]);
+defineEmits(["delete-song", "retry-song"]);
 
 const showLyrics = ref(false);
+
+const effectPosting = ref(false);
+const effectResult = ref(null);
+const effectError = ref(null);
+const effectForm = reactive({
+  datasetId: "",
+  fetcherIndex: 1,
+  authKey: "",
+});
 
 async function exportForEffect() {
   try {
@@ -76,6 +169,33 @@ async function exportForEffect() {
     URL.revokeObjectURL(url);
   } catch (err) {
     console.error("Export for Effect AI failed:", err);
+  }
+}
+
+async function postToEffect() {
+  effectResult.value = null;
+  effectError.value = null;
+  effectPosting.value = true;
+  try {
+    const response = await fetch(`${apiUrl}/postToEffect`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        authKey: effectForm.authKey,
+        datasetId: effectForm.datasetId,
+        fetcherIndex: effectForm.fetcherIndex,
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      effectError.value = data.error || "Unknown error";
+    } else {
+      effectResult.value = data;
+    }
+  } catch (err) {
+    effectError.value = err.message || "Request failed";
+  } finally {
+    effectPosting.value = false;
   }
 }
 </script>
