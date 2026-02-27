@@ -78,6 +78,30 @@ app.get("/", (req, res) => {
   res.sendStatus(200);
 });
 
+// GET /wallet/:pubkey/balances — SOL + NOS balance for any wallet
+app.get("/wallet/:pubkey/balances", async (req, res) => {
+  let pubkey;
+  try {
+    pubkey = new PublicKey(req.params.pubkey);
+  } catch {
+    return res.status(400).json({ error: "Invalid public key" });
+  }
+
+  try {
+    const [solLamports, nosRaw] = await Promise.all([
+      nosana.solana.getSolBalance(pubkey),
+      nosana.solana.getNosBalance(pubkey),
+    ]);
+    res.json({
+      sol: solLamports / 1e9,
+      nos: nosRaw ? Number(nosRaw.amount) / 1e6 : 0,
+    });
+  } catch (err) {
+    console.error("Balance fetch error:", err);
+    res.status(500).json({ error: "Failed to fetch balances" });
+  }
+});
+
 // POST /songurl
 app.post("/songurl", async (req, res) => {
   const { selectedSongID, songTitle, artistName } = req.body;

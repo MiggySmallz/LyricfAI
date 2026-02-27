@@ -8,6 +8,8 @@
       </div>
     </header>
 
+    <WalletBalances />
+
     <main class="flex-grow py-8">
       <UploadModule
         v-if="activeTab === 'upload'"
