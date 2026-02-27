@@ -494,6 +494,56 @@ app.post("/postToEffect", async (req, res) => {
   }
 });
 
+// POST /effectStats — fetch queue counts from an Effect AI fetcher
+app.post("/effectStats", async (req, res) => {
+  const { authKey, datasetId, fetcherIndex } = req.body;
+
+  const effectUrl = process.env.EFFECT_URL;
+  if (!effectUrl) return res.status(500).json({ error: "EFFECT_URL not configured on server" });
+  if (!authKey || !datasetId || fetcherIndex === undefined) {
+    return res.status(400).json({ error: "authKey, datasetId, and fetcherIndex are required" });
+  }
+
+  try {
+    const authRes = await axios.post(
+      `${effectUrl}/auth`,
+      new URLSearchParams({ key: authKey }).toString(),
+      {
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        maxRedirects: 5,
+        validateStatus: s => s < 500,
+      }
+    );
+    const setCookie = authRes.headers["set-cookie"];
+    if (!setCookie || !setCookie.length) {
+      return res.status(401).json({ error: "Effect AI auth failed — check authKey" });
+    }
+    const cookie = setCookie[0].split(";")[0];
+
+    const statsRes = await axios.get(
+      `${effectUrl}/d/${datasetId}/f/${fetcherIndex}`,
+      { headers: { Cookie: cookie }, validateStatus: s => s < 500 }
+    );
+
+    // The endpoint returns HTML, not JSON. Parse counts from <li> tags.
+    const html = String(statsRes.data ?? "");
+    const extract = (label) => {
+      const m = html.match(new RegExp(`<li>${label}:\\s*(\\d+)<\\/li>`));
+      return m ? parseInt(m[1], 10) : null;
+    };
+    res.json({
+      queue:  extract("Queued"),
+      active: extract("Active"),
+      done:   extract("Finished"),
+      failed: extract("Failed"),
+    });
+  } catch (err) {
+    const detail = err?.response?.data || err?.message || String(err);
+    console.error("effectStats error:", detail);
+    res.status(500).json({ error: "Failed to fetch Effect AI stats", detail: String(detail) });
+  }
+});
+
 // ---------------------------
 // Server + WebSocket
 // ---------------------------

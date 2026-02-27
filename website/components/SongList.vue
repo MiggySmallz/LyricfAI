@@ -105,7 +105,31 @@
         {{ effectError }}
       </div>
 
-      <div class="mt-4 flex justify-end">
+      <div v-if="effectStats" class="mt-4 rounded-md bg-blue-50 dark:bg-blue-900/20 p-3 text-sm text-blue-700 dark:text-blue-300">
+        <p class="font-medium mb-2">Fetcher status</p>
+        <div class="grid grid-cols-4 gap-2 text-center">
+          <div><p class="text-lg font-bold">{{ effectStats.queue ?? '—' }}</p><p class="text-xs">Pending</p></div>
+          <div><p class="text-lg font-bold">{{ effectStats.active ?? '—' }}</p><p class="text-xs">Active</p></div>
+          <div><p class="text-lg font-bold text-green-600 dark:text-green-400">{{ effectStats.done ?? '—' }}</p><p class="text-xs">Done</p></div>
+          <div><p class="text-lg font-bold text-red-600 dark:text-red-400">{{ effectStats.failed ?? '—' }}</p><p class="text-xs">Failed</p></div>
+        </div>
+      </div>
+
+      <div v-if="effectStatsError" class="mt-4 rounded-md bg-red-50 dark:bg-red-900/20 p-3 text-sm text-red-700 dark:text-red-300">
+        {{ effectStatsError }}
+      </div>
+
+      <div class="mt-4 flex justify-end gap-2">
+        <UButton
+          color="neutral"
+          variant="soft"
+          icon="i-heroicons-chart-bar"
+          :loading="effectStatsLoading"
+          :disabled="!effectForm.datasetId || !effectForm.authKey"
+          @click="checkEffectStats"
+        >
+          Check results
+        </UButton>
         <UButton
           color="primary"
           icon="i-heroicons-cloud-arrow-up"
@@ -121,7 +145,7 @@
 </template>
 
 <script setup>
-import { ref, reactive } from "vue";
+import { ref, reactive, onUnmounted } from "vue";
 
 // Songs with no lyrics that were submitted more than 30 minutes ago are considered failed
 const FAILURE_TIMEOUT_MS = 30 * 60 * 1000;
@@ -146,11 +170,24 @@ const showLyrics = ref(false);
 const effectPosting = ref(false);
 const effectResult = ref(null);
 const effectError = ref(null);
+const effectStats = ref(null);
+const effectStatsError = ref(null);
+const effectStatsLoading = ref(false);
+const effectStatsInterval = ref(null);
 const effectForm = reactive({
   datasetId: "",
   fetcherIndex: 1,
   authKey: "",
 });
+
+function stopStatsPolling() {
+  if (effectStatsInterval.value) {
+    clearInterval(effectStatsInterval.value);
+    effectStatsInterval.value = null;
+  }
+}
+
+onUnmounted(stopStatsPolling);
 
 async function exportForEffect() {
   try {
@@ -169,6 +206,44 @@ async function exportForEffect() {
     URL.revokeObjectURL(url);
   } catch (err) {
     console.error("Export for Effect AI failed:", err);
+  }
+}
+
+async function fetchEffectStats(showLoading = false) {
+  if (showLoading) effectStatsLoading.value = true;
+  try {
+    const response = await fetch(`${apiUrl}/effectStats`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        authKey: effectForm.authKey,
+        datasetId: effectForm.datasetId,
+        fetcherIndex: effectForm.fetcherIndex,
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      effectStatsError.value = data.error || "Unknown error";
+      stopStatsPolling();
+    } else {
+      effectStats.value = data;
+      effectStatsError.value = null;
+    }
+  } catch (err) {
+    effectStatsError.value = err.message || "Request failed";
+    stopStatsPolling();
+  } finally {
+    if (showLoading) effectStatsLoading.value = false;
+  }
+}
+
+async function checkEffectStats() {
+  effectStats.value = null;
+  effectStatsError.value = null;
+  stopStatsPolling();
+  await fetchEffectStats(true);
+  if (!effectStatsError.value) {
+    effectStatsInterval.value = setInterval(() => fetchEffectStats(false), 10000);
   }
 }
 
