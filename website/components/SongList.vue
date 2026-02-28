@@ -140,6 +140,87 @@
           Post campaign
         </UButton>
       </div>
+
+      <!-- Phase 2: Full Song Validation -->
+      <div class="mt-6 border-t border-gray-200 dark:border-gray-700 pt-5">
+        <h4 class="text-sm font-semibold mb-3">Phase 2 — Full Song Validation</h4>
+
+        <div class="grid grid-cols-2 gap-4">
+          <div class="space-y-1">
+            <label class="block text-sm font-medium">Phase 2 Dataset ID</label>
+            <input
+              v-model="phase2DatasetId"
+              class="w-full rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+              placeholder="Phase 2 dataset ID"
+            />
+          </div>
+          <div class="space-y-1">
+            <label class="block text-sm font-medium">Phase 2 Fetcher index</label>
+            <input
+              v-model.number="phase2FetcherIndex"
+              type="number"
+              min="0"
+              step="1"
+              class="w-full rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+              placeholder="e.g. 1"
+            />
+          </div>
+        </div>
+
+        <div v-if="phase2Result" class="mt-4 rounded-md bg-green-50 dark:bg-green-900/20 p-3 text-sm text-green-700 dark:text-green-300">
+          Phase 2 posted! {{ phase2Result.taskCount }} songs queued for full-song validation.
+        </div>
+
+        <div v-if="phase2Error" class="mt-4 rounded-md bg-red-50 dark:bg-red-900/20 p-3 text-sm text-red-700 dark:text-red-300">
+          {{ phase2Error }}
+        </div>
+
+        <div v-if="phase2Stats" class="mt-4 rounded-md bg-blue-50 dark:bg-blue-900/20 p-3 text-sm text-blue-700 dark:text-blue-300">
+          <p class="font-medium mb-2">Phase 2 status</p>
+          <div class="grid grid-cols-4 gap-2 text-center">
+            <div><p class="text-lg font-bold">{{ phase2Stats.queue ?? '—' }}</p><p class="text-xs">Pending</p></div>
+            <div><p class="text-lg font-bold">{{ phase2Stats.active ?? '—' }}</p><p class="text-xs">Active</p></div>
+            <div><p class="text-lg font-bold text-green-600 dark:text-green-400">{{ phase2Stats.done ?? '—' }}</p><p class="text-xs">Done</p></div>
+            <div><p class="text-lg font-bold text-red-600 dark:text-red-400">{{ phase2Stats.failed ?? '—' }}</p><p class="text-xs">Failed</p></div>
+          </div>
+        </div>
+
+        <div v-if="phase2StatsError" class="mt-4 rounded-md bg-red-50 dark:bg-red-900/20 p-3 text-sm text-red-700 dark:text-red-300">
+          {{ phase2StatsError }}
+        </div>
+
+        <div class="mt-4 flex justify-end gap-2">
+          <UButton
+            color="neutral"
+            variant="soft"
+            icon="i-heroicons-arrow-down-tray"
+            :loading="phase2Downloading"
+            :disabled="!phase2DatasetId || !effectForm.authKey"
+            @click="downloadPhase2"
+          >
+            Download results
+          </UButton>
+          <UButton
+            color="neutral"
+            variant="soft"
+            icon="i-heroicons-chart-bar"
+            :loading="phase2StatsLoading"
+            :disabled="!phase2DatasetId || !effectForm.authKey"
+            @click="checkPhase2Stats"
+          >
+            Check Phase 2
+          </UButton>
+          <UButton
+            color="primary"
+            icon="i-heroicons-arrow-path"
+            :loading="phase2Posting"
+            :disabled="!effectForm.datasetId || !phase2DatasetId || !effectForm.authKey"
+            @click="compileAndPostPhase2"
+          >
+            Compile &amp; Post Phase 2
+          </UButton>
+        </div>
+      </div>
     </UCard>
   </section>
 </template>
@@ -180,6 +261,18 @@ const effectForm = reactive({
   authKey: "",
 });
 
+// Phase 2 state
+const phase2DatasetId = ref("");
+const phase2FetcherIndex = ref(1);
+const phase2Posting = ref(false);
+const phase2Result = ref(null);
+const phase2Error = ref(null);
+const phase2Downloading = ref(false);
+const phase2Stats = ref(null);
+const phase2StatsError = ref(null);
+const phase2StatsLoading = ref(false);
+const phase2StatsInterval = ref(null);
+
 function stopStatsPolling() {
   if (effectStatsInterval.value) {
     clearInterval(effectStatsInterval.value);
@@ -187,7 +280,14 @@ function stopStatsPolling() {
   }
 }
 
-onUnmounted(stopStatsPolling);
+function stopPhase2Polling() {
+  if (phase2StatsInterval.value) {
+    clearInterval(phase2StatsInterval.value);
+    phase2StatsInterval.value = null;
+  }
+}
+
+onUnmounted(() => { stopStatsPolling(); stopPhase2Polling(); });
 
 async function exportForEffect() {
   try {
@@ -271,6 +371,105 @@ async function postToEffect() {
     effectError.value = err.message || "Request failed";
   } finally {
     effectPosting.value = false;
+  }
+}
+
+// Phase 2 functions
+async function fetchPhase2Stats(showLoading = false) {
+  if (showLoading) phase2StatsLoading.value = true;
+  try {
+    const response = await fetch(`${apiUrl}/effectStats`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        authKey: effectForm.authKey,
+        datasetId: phase2DatasetId.value,
+        fetcherIndex: phase2FetcherIndex.value,
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      phase2StatsError.value = data.error || "Unknown error";
+      stopPhase2Polling();
+    } else {
+      phase2Stats.value = data;
+      phase2StatsError.value = null;
+    }
+  } catch (err) {
+    phase2StatsError.value = err.message || "Request failed";
+    stopPhase2Polling();
+  } finally {
+    if (showLoading) phase2StatsLoading.value = false;
+  }
+}
+
+async function checkPhase2Stats() {
+  phase2Stats.value = null;
+  phase2StatsError.value = null;
+  stopPhase2Polling();
+  await fetchPhase2Stats(true);
+  if (!phase2StatsError.value) {
+    phase2StatsInterval.value = setInterval(() => fetchPhase2Stats(false), 10000);
+  }
+}
+
+async function compileAndPostPhase2() {
+  phase2Result.value = null;
+  phase2Error.value = null;
+  phase2Posting.value = true;
+  try {
+    const response = await fetch(`${apiUrl}/compileAndPostPhase2`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        authKey: effectForm.authKey,
+        phase1DatasetId: effectForm.datasetId,
+        phase1FetcherIndex: effectForm.fetcherIndex,
+        phase2DatasetId: phase2DatasetId.value,
+        phase2FetcherIndex: phase2FetcherIndex.value,
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      phase2Error.value = data.error || "Unknown error";
+    } else {
+      phase2Result.value = data;
+    }
+  } catch (err) {
+    phase2Error.value = err.message || "Request failed";
+  } finally {
+    phase2Posting.value = false;
+  }
+}
+
+async function downloadPhase2() {
+  phase2Downloading.value = true;
+  try {
+    const response = await fetch(`${apiUrl}/downloadPhase2`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        authKey: effectForm.authKey,
+        datasetId: phase2DatasetId.value,
+        fetcherIndex: phase2FetcherIndex.value,
+      }),
+    });
+    if (!response.ok) {
+      const data = await response.json();
+      phase2Error.value = data.error || "Download failed";
+      return;
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "phase2_results.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    phase2Error.value = err.message || "Download failed";
+  } finally {
+    phase2Downloading.value = false;
   }
 }
 </script>

@@ -15,6 +15,7 @@
     "@nosana/sdk": "^0.4.25",
     "axios": "^1.11.0",
     "cors": "^2.8.5",
+    "csv-parse": "^6.1.0",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "json2csv": "^6.0.0-alpha.2",
