@@ -21,6 +21,32 @@ import { parse as csvParse } from "csv-parse/sync";
 
 dotenv.config();
 
+// ---------------------------
+// Effect AI server-side config
+// ---------------------------
+const EFFECT_AUTH_KEY             = process.env.EFFECT_AUTH_KEY;
+const EFFECT_PHASE1_DATASET_ID    = process.env.EFFECT_PHASE1_DATASET_ID;
+const EFFECT_PHASE1_FETCHER_INDEX = process.env.EFFECT_PHASE1_FETCHER_INDEX !== undefined
+  ? parseInt(process.env.EFFECT_PHASE1_FETCHER_INDEX, 10) : null;
+const EFFECT_PHASE2_DATASET_ID    = process.env.EFFECT_PHASE2_DATASET_ID;
+const EFFECT_PHASE2_FETCHER_INDEX = process.env.EFFECT_PHASE2_FETCHER_INDEX !== undefined
+  ? parseInt(process.env.EFFECT_PHASE2_FETCHER_INDEX, 10) : null;
+
+// Authenticate with the Effect AI task-poster; returns the session cookie or null
+async function getEffectCookie() {
+  const effectUrl = process.env.EFFECT_URL;
+  if (!effectUrl || !EFFECT_AUTH_KEY) return null;
+  try {
+    const authRes = await axios.post(
+      `${effectUrl}/auth`,
+      new URLSearchParams({ key: EFFECT_AUTH_KEY }).toString(),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" }, maxRedirects: 5, validateStatus: s => s < 500 }
+    );
+    const setCookie = authRes.headers["set-cookie"];
+    return setCookie?.length ? setCookie[0].split(";")[0] : null;
+  } catch { return null; }
+}
+
 const app = express();
 app.use(express.json());
 app.use(cors());
@@ -350,6 +376,9 @@ app.post("/addSong", async (req, res) => {
     data: song,
   });
 
+  // Fire-and-forget: auto-post this song's segments to Effect AI Phase 1
+  autoPostSongToEffect(song).catch(e => console.warn("autoPostSongToEffect:", e?.message));
+
   res.json({ status: "ok" });
 });
 
@@ -359,11 +388,70 @@ app.post("/checkJob", async (req, res) => {
   if (!jobID) return res.status(400).json({ error: "jobID required" });
 
   const record = await kvGetSong(jobID);
-  if (record && record.lyrics) {
-    return res.json({ status: 200, lyrics: record.lyrics });
-  } else {
-    return res.json({ status: 204 });
+  if (!record) return res.json({ status: 204 });
+
+  if (record.lyrics) {
+    return res.json({
+      status: 200,
+      lyrics: record.lyrics,
+      validatedLyrics: record.validatedLyrics || null,
+    });
   }
+
+  // Already confirmed failed on a previous check
+  if (record.status === "failed") {
+    return res.json({ status: 204, failed: true });
+  }
+
+  // For jobs pending > 5 min with a Nosana job address, read the on-chain job
+  // state via the SDK. Only mark as failed if the job is STOPPED or the account
+  // doesn't exist at all (tx never confirmed).
+  if (record.nosanaJob && !record.nosanaJobChecked && record.createdAt) {
+    const ageMs = Date.now() - new Date(record.createdAt).getTime();
+    if (ageMs > 5 * 60 * 1000) {
+      try {
+        const jobData = await nosana.jobs.get(record.nosanaJob);
+        if (jobData?.state === "STOPPED") {
+          console.log(`checkJob: Nosana job STOPPED for ${jobID} — marking failed`);
+          await state.db.set(["songs", jobID], { ...record, status: "failed", nosanaJobChecked: true });
+          return res.json({ status: 204, failed: true });
+        }
+        if (jobData?.state === "COMPLETED" && jobData?.ipfsResult) {
+          // Fetch the IPFS result and check whether the container actually succeeded
+          try {
+            const ipfsUrl = `${nosana.ipfs.config.gateway}${jobData.ipfsResult}`;
+            const controller = new AbortController();
+            const t = setTimeout(() => controller.abort(), 8000);
+            const ipfsRes = await fetch(ipfsUrl, { signal: controller.signal });
+            clearTimeout(t);
+            const result = await ipfsRes.json();
+            const containerFailed = result?.opStates?.some(op => op.exitCode !== 0);
+            if (containerFailed) {
+              console.log(`checkJob: Nosana job COMPLETED but container exited non-zero for ${jobID} — marking failed`);
+              await state.db.set(["songs", jobID], { ...record, status: "failed", nosanaJobChecked: true });
+              return res.json({ status: 204, failed: true });
+            }
+          } catch (ipfsErr) {
+            console.warn(`checkJob: could not read IPFS result for ${jobID}:`, ipfsErr?.message);
+          }
+        }
+        // Job is QUEUED / RUNNING / or COMPLETED with exit 0 — stop re-checking every poll
+        await state.db.set(["songs", jobID], { ...record, nosanaJobChecked: true });
+      } catch (err) {
+        // Anchor throws when the account doesn't exist (tx never landed on-chain)
+        const msg = err?.message ?? "";
+        if (msg.includes("Account does not exist") || msg.includes("could not find account")) {
+          console.log(`checkJob: Nosana job account missing for ${jobID} — marking failed`);
+          await state.db.set(["songs", jobID], { ...record, status: "failed", nosanaJobChecked: true });
+          return res.json({ status: 204, failed: true });
+        }
+        // RPC or other transient error — skip, retry next poll
+        console.warn(`checkJob: could not read Nosana job for ${jobID}:`, msg);
+      }
+    }
+  }
+
+  return res.json({ status: 204 });
 });
 
 // Shared SRT helpers
@@ -393,6 +481,251 @@ function parseSRTtoRows(srtText, jobID, songUrl, songTitle = "", artistName = ""
     }];
   });
 }
+
+// ---------------------------
+// Effect AI helpers
+// ---------------------------
+
+// Convert a segments array [{start,end,lyrics}] back to SRT format
+function segmentsToSRT(segments) {
+  const toSRTTime = (s) => {
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = Math.floor(s % 60);
+    const ms = Math.round((s % 1) * 1000);
+    return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(sec).padStart(2,"0")},${String(ms).padStart(3,"0")}`;
+  };
+  return segments.map((seg, i) =>
+    `${i + 1}\n${toSRTTime(seg.start)} --> ${toSRTTime(seg.end)}\n${seg.lyrics}`
+  ).join("\n\n");
+}
+
+// Post a single song's SRT segments to the Phase 1 Effect AI fetcher (called after /addSong)
+async function autoPostSongToEffect(song) {
+  const effectUrl = process.env.EFFECT_URL;
+  if (!effectUrl || !EFFECT_AUTH_KEY || !EFFECT_PHASE1_DATASET_ID || EFFECT_PHASE1_FETCHER_INDEX === null) return;
+  const rows = parseSRTtoRows(song.lyrics, song.jobID, song.songUrl, song.songTitle, song.artistName, song.nosanaJob);
+  if (!rows.length) return;
+  try {
+    const parser = new Parser({ fields: ["jobID", "title", "artist", "song_url", "nosana_job", "start", "end", "lyrics"] });
+    const csv = parser.parse(rows);
+    const cookie = await getEffectCookie();
+    if (!cookie) { console.warn("autoPostSongToEffect: could not get Effect AI cookie"); return; }
+    await axios.post(
+      `${effectUrl}/d/${EFFECT_PHASE1_DATASET_ID}/f/${EFFECT_PHASE1_FETCHER_INDEX}/import`,
+      new URLSearchParams({ csv, delimiter: "," }).toString(),
+      { headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded" } }
+    );
+    await state.db.set(["songs", song.jobID], { ...song, effectPhase1Posted: true });
+    console.log(`Auto-posted ${rows.length} segments for job ${song.jobID} to Effect AI Phase 1`);
+  } catch (err) {
+    console.warn("autoPostSongToEffect failed:", err?.message);
+  }
+}
+
+// Background scan: update per-song Phase 1 validated counts and apply Phase 2 validated lyrics
+async function scanEffectResults() {
+  const effectUrl = process.env.EFFECT_URL;
+  if (!effectUrl || !EFFECT_AUTH_KEY) return;
+
+  try {
+    const cookie = await getEffectCookie();
+    if (!cookie) return;
+
+    // --- Phase 1 scan: count unique validated segments per jobID ---
+    if (EFFECT_PHASE1_DATASET_ID && EFFECT_PHASE1_FETCHER_INDEX !== null) {
+      try {
+        const p1Res = await axios.get(
+          `${effectUrl}/d/${EFFECT_PHASE1_DATASET_ID}/f/${EFFECT_PHASE1_FETCHER_INDEX}/download`,
+          { headers: { Cookie: cookie }, responseType: "text", validateStatus: s => s < 500 }
+        );
+        if (p1Res.data?.trim()) {
+          const rows = csvParse(p1Res.data, { columns: true, skip_empty_lines: true, trim: true });
+
+          // Build count set AND full segment data per song (needed for Phase 2 auto-post)
+          const counts   = new Map(); // jobID -> Set of "start-end" keys
+          const songData = new Map(); // jobID -> { song_url, segments: Map<"start-end", {start,end,lyrics}> }
+
+          for (const row of rows) {
+            try {
+              const answer = JSON.parse(row.result)?.values?.answer;
+              if (!answer?.jobID || answer.allowedStart === undefined) continue;
+              const segKey = `${answer.allowedStart}-${answer.allowedEnd}`;
+
+              if (!counts.has(answer.jobID)) counts.set(answer.jobID, new Set());
+              counts.get(answer.jobID).add(segKey);
+
+              if (!songData.has(answer.jobID)) {
+                songData.set(answer.jobID, { song_url: answer.song, segments: new Map() });
+              }
+              // Keep last submission per segment (Map overwrites on duplicate key)
+              songData.get(answer.jobID).segments.set(segKey, {
+                start:  answer.allowedStart,
+                end:    answer.allowedEnd,
+                lyrics: answer.verifiedLyrics,
+              });
+            } catch (e) {
+              console.warn("Effect Phase 1 scan: row parse error:", e?.message);
+            }
+          }
+
+          // Update KV with Phase 1 counts
+          for (const [jobID, segSet] of counts) {
+            const existing = (await state.db.get(["effect_status", jobID]))?.data ?? {};
+            await state.db.set(["effect_status", jobID], {
+              ...existing,
+              phase1ValidatedSegments: segSet.size,
+              phase1LastScan: new Date().toISOString(),
+            });
+          }
+          console.log(`Effect scan: Phase 1 updated ${counts.size} songs`);
+
+          // Auto-post Phase 2 for songs where all segments are now validated
+          if (EFFECT_PHASE2_DATASET_ID && EFFECT_PHASE2_FETCHER_INDEX !== null) {
+            const phase2ReadyRows = [];
+            for (const [jobID, data] of songData) {
+              try {
+                const song = await kvGetSong(jobID);
+                if (!song?.lyrics) continue;
+                const totalSegs = parseSRTtoRows(song.lyrics, jobID, song.songUrl).length;
+                if (totalSegs === 0 || data.segments.size < totalSegs) continue;
+
+                const effectStatus = (await state.db.get(["effect_status", jobID]))?.data ?? {};
+                if (effectStatus.phase2Posted) continue; // already posted
+
+                const segments = Array.from(data.segments.values()).sort((a, b) => a.start - b.start);
+                phase2ReadyRows.push({ song_url: data.song_url, jobID, segments });
+
+                // Mark as posted before attempting (will revert on failure)
+                await state.db.set(["effect_status", jobID], {
+                  ...effectStatus,
+                  phase1ValidatedSegments: data.segments.size,
+                  phase1LastScan: new Date().toISOString(),
+                  phase2Posted: true,
+                  phase2PostedAt: new Date().toISOString(),
+                });
+                console.log(`Effect scan: queued auto Phase 2 for ${jobID} (${data.segments.size}/${totalSegs} segments validated)`);
+              } catch (e) {
+                console.warn(`Effect scan: Phase 2 auto-post check error for ${jobID}:`, e?.message);
+              }
+            }
+
+            if (phase2ReadyRows.length) {
+              try {
+                const csvLines = ["song_url,jobID,segments"];
+                for (const s of phase2ReadyRows) {
+                  const segmentsJson = JSON.stringify(s.segments);
+                  const escaped = '"' + segmentsJson.replace(/"/g, '""') + '"';
+                  csvLines.push(`${s.song_url},${s.jobID},${escaped}`);
+                }
+                await axios.post(
+                  `${effectUrl}/d/${EFFECT_PHASE2_DATASET_ID}/f/${EFFECT_PHASE2_FETCHER_INDEX}/import`,
+                  new URLSearchParams({ csv: csvLines.join("\n"), delimiter: "," }).toString(),
+                  { headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded" } }
+                );
+                console.log(`Effect scan: auto-posted Phase 2 for ${phase2ReadyRows.length} song(s)`);
+              } catch (e) {
+                console.warn("Effect auto-post Phase 2 error:", e?.message);
+                // Revert phase2Posted so the next scan retries
+                for (const row of phase2ReadyRows) {
+                  try {
+                    const existing = (await state.db.get(["effect_status", row.jobID]))?.data ?? {};
+                    await state.db.set(["effect_status", row.jobID], { ...existing, phase2Posted: false });
+                  } catch {}
+                }
+              }
+            }
+          }
+        }
+      } catch (e) { console.warn("Effect Phase 1 scan error:", e?.message); }
+    }
+
+    // --- Phase 2 scan: apply validated full-song lyrics ---
+    if (EFFECT_PHASE2_DATASET_ID && EFFECT_PHASE2_FETCHER_INDEX !== null) {
+      try {
+        const p2Res = await axios.get(
+          `${effectUrl}/d/${EFFECT_PHASE2_DATASET_ID}/f/${EFFECT_PHASE2_FETCHER_INDEX}/download`,
+          { headers: { Cookie: cookie }, responseType: "text", validateStatus: s => s < 500 }
+        );
+        if (!p2Res.data?.trim()) {
+          console.log("Effect Phase 2 scan: download returned empty");
+        } else {
+          const rows = csvParse(p2Res.data, { columns: true, skip_empty_lines: true, trim: true });
+          console.log(`Effect Phase 2 scan: ${rows.length} row(s) found`);
+          for (const row of rows) {
+            try {
+              const payload = JSON.parse(row.result);
+              const answer = payload?.values?.answer;
+              if (!answer?.jobID) {
+                console.log("Effect Phase 2 scan: row skipped — no jobID. Answer keys:", Object.keys(answer ?? {}));
+                continue;
+              }
+              // Accept verifiedLyrics, verifiedSegments, or segments as the validated array field
+              const segs = answer.verifiedLyrics ?? answer.verifiedSegments ?? answer.segments;
+              if (!Array.isArray(segs) || !segs.length) {
+                console.log(`Effect Phase 2 scan: ${answer.jobID} skipped — no segments array. Answer keys: [${Object.keys(answer).join(", ")}]`);
+                continue;
+              }
+
+              const song = await kvGetSong(answer.jobID);
+              if (!song) {
+                console.log(`Effect Phase 2 scan: ${answer.jobID} not found in KV — skipping`);
+                continue;
+              }
+              if (song.validatedLyrics) {
+                console.log(`Effect Phase 2 scan: ${answer.jobID} already has validatedLyrics — skipping`);
+                continue;
+              }
+
+              const validatedSRT = segmentsToSRT(segs);
+              const updated = { ...song, lyrics: validatedSRT, validatedLyrics: segs };
+              await state.db.set(["songs", answer.jobID], updated);
+
+              // Mark Phase 2 complete in effect_status
+              const existing = (await state.db.get(["effect_status", answer.jobID]))?.data ?? {};
+              await state.db.set(["effect_status", answer.jobID], {
+                ...existing, phase2Completed: true, phase2CompletedAt: new Date().toISOString(),
+              });
+
+              broadcastUpdate(answer.jobID, { type: "lyrics_ready", data: updated });
+              console.log(`Effect scan: applied Phase 2 validated lyrics for ${answer.jobID}`);
+            } catch (e) {
+              console.warn("Effect Phase 2 scan: row processing error:", e?.message, "| raw result preview:", String(row.result ?? "").slice(0, 200));
+            }
+          }
+        }
+      } catch (e) { console.warn("Effect Phase 2 scan error:", e?.message); }
+    }
+  } catch (err) {
+    console.warn("scanEffectResults error:", err?.message);
+  }
+}
+
+// GET /effectStatus/:jobID — per-song Effect AI validation status
+app.get("/effectStatus/:jobID", async (req, res) => {
+  const { jobID } = req.params;
+  const song = await kvGetSong(jobID);
+  if (!song) return res.status(404).json({ error: "Job not found" });
+
+  const totalSegments = parseSRTtoRows(song.lyrics || "", jobID, song.songUrl).length;
+  const effectStatus  = (await state.db.get(["effect_status", jobID]))?.data ?? {};
+
+  res.json({
+    jobID,
+    effectPhase1Posted: song.effectPhase1Posted ?? false,
+    phase1: {
+      total:     totalSegments,
+      validated: effectStatus.phase1ValidatedSegments ?? 0,
+      lastScan:  effectStatus.phase1LastScan ?? null,
+    },
+    phase2: {
+      posted:      effectStatus.phase2Posted ?? false,
+      postedAt:    effectStatus.phase2PostedAt ?? null,
+      completed:   effectStatus.phase2Completed ?? false,
+      completedAt: effectStatus.phase2CompletedAt ?? null,
+    },
+  });
+});
 
 // GET /downloadCSV — one row per lyric segment
 app.get("/downloadCSV", async (req, res) => {
@@ -442,18 +775,19 @@ app.get("/exportForEffect", async (req, res) => {
   }
 });
 
-// POST /postToEffect — import ready lyrics into an existing Effect AI fetcher
+// POST /postToEffect — import ready lyrics into the Phase 1 Effect AI fetcher
 app.post("/postToEffect", async (req, res) => {
-  const { authKey, datasetId, fetcherIndex } = req.body;
+  const { datasetId, fetcherIndex } = req.body;
+  const _datasetId    = datasetId    ?? EFFECT_PHASE1_DATASET_ID;
+  const _fetcherIndex = fetcherIndex ?? EFFECT_PHASE1_FETCHER_INDEX;
 
   const effectUrl = process.env.EFFECT_URL;
   if (!effectUrl) return res.status(500).json({ error: "EFFECT_URL not configured on server" });
-  if (!authKey || !datasetId || fetcherIndex === undefined) {
-    return res.status(400).json({ error: "authKey, datasetId, and fetcherIndex are required" });
+  if (!_datasetId || _fetcherIndex === null) {
+    return res.status(400).json({ error: "datasetId and fetcherIndex are required (or set EFFECT_PHASE1_DATASET_ID/EFFECT_PHASE1_FETCHER_INDEX env vars)" });
   }
 
   try {
-    // 1. Build CSV (same logic as /exportForEffect)
     const allSongs = await kvListAllSongs();
     const readySongs = allSongs.map(s => s.data).filter(d => d?.status === "ready" && d?.lyrics);
     if (!readySongs.length) return res.status(400).json({ error: "No ready songs to export" });
@@ -464,30 +798,16 @@ app.post("/postToEffect", async (req, res) => {
     const parser = new Parser({ fields: ["jobID", "title", "artist", "song_url", "nosana_job", "start", "end", "lyrics"] });
     const csv = parser.parse(rows);
 
-    // 2. Authenticate with task-poster (cookie session)
-    const authRes = await axios.post(
-      `${effectUrl}/auth`,
-      new URLSearchParams({ key: authKey }).toString(),
-      {
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        maxRedirects: 5,
-        validateStatus: s => s < 500,
-      }
-    );
-    const setCookie = authRes.headers["set-cookie"];
-    if (!setCookie || !setCookie.length) {
-      return res.status(401).json({ error: "Effect AI auth failed — check authKey" });
-    }
-    const cookie = setCookie[0].split(";")[0];
+    const cookie = await getEffectCookie();
+    if (!cookie) return res.status(401).json({ error: "Effect AI auth failed — check EFFECT_AUTH_KEY server env var" });
 
-    // 3. Import CSV into the existing fetcher
     await axios.post(
-      `${effectUrl}/d/${datasetId}/f/${fetcherIndex}/import`,
+      `${effectUrl}/d/${_datasetId}/f/${_fetcherIndex}/import`,
       new URLSearchParams({ csv, delimiter: "," }).toString(),
       { headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded" } }
     );
 
-    res.json({ status: "ok", datasetId, fetcherIndex, taskCount: rows.length });
+    res.json({ status: "ok", datasetId: _datasetId, fetcherIndex: _fetcherIndex, taskCount: rows.length });
   } catch (err) {
     const detail = err?.response?.data || err?.message || String(err);
     console.error("postToEffect error:", detail);
@@ -497,29 +817,17 @@ app.post("/postToEffect", async (req, res) => {
 
 // POST /effectStats — fetch queue counts from an Effect AI fetcher
 app.post("/effectStats", async (req, res) => {
-  const { authKey, datasetId, fetcherIndex } = req.body;
+  const { datasetId, fetcherIndex } = req.body;
 
   const effectUrl = process.env.EFFECT_URL;
   if (!effectUrl) return res.status(500).json({ error: "EFFECT_URL not configured on server" });
-  if (!authKey || !datasetId || fetcherIndex === undefined) {
-    return res.status(400).json({ error: "authKey, datasetId, and fetcherIndex are required" });
+  if (!datasetId || fetcherIndex === undefined) {
+    return res.status(400).json({ error: "datasetId and fetcherIndex are required" });
   }
 
   try {
-    const authRes = await axios.post(
-      `${effectUrl}/auth`,
-      new URLSearchParams({ key: authKey }).toString(),
-      {
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        maxRedirects: 5,
-        validateStatus: s => s < 500,
-      }
-    );
-    const setCookie = authRes.headers["set-cookie"];
-    if (!setCookie || !setCookie.length) {
-      return res.status(401).json({ error: "Effect AI auth failed — check authKey" });
-    }
-    const cookie = setCookie[0].split(";")[0];
+    const cookie = await getEffectCookie();
+    if (!cookie) return res.status(401).json({ error: "Effect AI auth failed — check EFFECT_AUTH_KEY server env var" });
 
     const statsRes = await axios.get(
       `${effectUrl}/d/${datasetId}/f/${fetcherIndex}`,
@@ -547,28 +855,22 @@ app.post("/effectStats", async (req, res) => {
 
 // POST /debugPhase1Parse — download + parse Phase 1 results without posting to Phase 2 (for testing)
 app.post("/debugPhase1Parse", async (req, res) => {
-  const { authKey, phase1DatasetId, phase1FetcherIndex } = req.body;
+  const { phase1DatasetId, phase1FetcherIndex } = req.body;
+  const _datasetId    = phase1DatasetId    ?? EFFECT_PHASE1_DATASET_ID;
+  const _fetcherIndex = phase1FetcherIndex ?? EFFECT_PHASE1_FETCHER_INDEX;
 
   const effectUrl = process.env.EFFECT_URL;
   if (!effectUrl) return res.status(500).json({ error: "EFFECT_URL not configured on server" });
-  if (!authKey || !phase1DatasetId || phase1FetcherIndex === undefined) {
-    return res.status(400).json({ error: "authKey, phase1DatasetId, phase1FetcherIndex are required" });
+  if (!_datasetId || _fetcherIndex === null) {
+    return res.status(400).json({ error: "phase1DatasetId and phase1FetcherIndex are required" });
   }
 
   try {
-    const authRes = await axios.post(
-      `${effectUrl}/auth`,
-      new URLSearchParams({ key: authKey }).toString(),
-      { headers: { "Content-Type": "application/x-www-form-urlencoded" }, maxRedirects: 5, validateStatus: s => s < 500 }
-    );
-    const setCookie = authRes.headers["set-cookie"];
-    if (!setCookie || !setCookie.length) {
-      return res.status(401).json({ error: "Effect AI auth failed — check authKey" });
-    }
-    const cookie = setCookie[0].split(";")[0];
+    const cookie = await getEffectCookie();
+    if (!cookie) return res.status(401).json({ error: "Effect AI auth failed — check EFFECT_AUTH_KEY server env var" });
 
     const dlRes = await axios.get(
-      `${effectUrl}/d/${phase1DatasetId}/f/${phase1FetcherIndex}/download`,
+      `${effectUrl}/d/${_datasetId}/f/${_fetcherIndex}/download`,
       { headers: { Cookie: cookie }, responseType: "text", validateStatus: s => s < 500 }
     );
 
@@ -618,31 +920,26 @@ app.post("/debugPhase1Parse", async (req, res) => {
 
 // POST /compileAndPostPhase2 — download Phase 1 results, compile per-song, import to Phase 2 fetcher
 app.post("/compileAndPostPhase2", async (req, res) => {
-  const { authKey, phase1DatasetId, phase1FetcherIndex, phase2DatasetId, phase2FetcherIndex } = req.body;
+  const { phase1DatasetId, phase1FetcherIndex, phase2DatasetId, phase2FetcherIndex } = req.body;
+  const _p1DatasetId    = phase1DatasetId    ?? EFFECT_PHASE1_DATASET_ID;
+  const _p1FetcherIndex = phase1FetcherIndex ?? EFFECT_PHASE1_FETCHER_INDEX;
+  const _p2DatasetId    = phase2DatasetId    ?? EFFECT_PHASE2_DATASET_ID;
+  const _p2FetcherIndex = phase2FetcherIndex ?? EFFECT_PHASE2_FETCHER_INDEX;
 
   const effectUrl = process.env.EFFECT_URL;
   if (!effectUrl) return res.status(500).json({ error: "EFFECT_URL not configured on server" });
-  if (!authKey || !phase1DatasetId || phase1FetcherIndex === undefined ||
-      !phase2DatasetId || phase2FetcherIndex === undefined) {
-    return res.status(400).json({ error: "authKey, phase1DatasetId, phase1FetcherIndex, phase2DatasetId, and phase2FetcherIndex are required" });
+  if (!_p1DatasetId || _p1FetcherIndex === null || !_p2DatasetId || _p2FetcherIndex === null) {
+    return res.status(400).json({ error: "Phase 1 and Phase 2 datasetId/fetcherIndex are required (or set env vars)" });
   }
 
   try {
     // 1. Auth
-    const authRes = await axios.post(
-      `${effectUrl}/auth`,
-      new URLSearchParams({ key: authKey }).toString(),
-      { headers: { "Content-Type": "application/x-www-form-urlencoded" }, maxRedirects: 5, validateStatus: s => s < 500 }
-    );
-    const setCookie = authRes.headers["set-cookie"];
-    if (!setCookie || !setCookie.length) {
-      return res.status(401).json({ error: "Effect AI auth failed — check authKey" });
-    }
-    const cookie = setCookie[0].split(";")[0];
+    const cookie = await getEffectCookie();
+    if (!cookie) return res.status(401).json({ error: "Effect AI auth failed — check EFFECT_AUTH_KEY server env var" });
 
     // 2. Download Phase 1 results CSV
     const dlRes = await axios.get(
-      `${effectUrl}/d/${phase1DatasetId}/f/${phase1FetcherIndex}/download`,
+      `${effectUrl}/d/${_p1DatasetId}/f/${_p1FetcherIndex}/download`,
       { headers: { Cookie: cookie }, responseType: "text", validateStatus: s => s < 500 }
     );
     if (!dlRes.data || !dlRes.data.trim()) {
@@ -702,12 +999,12 @@ app.post("/compileAndPostPhase2", async (req, res) => {
 
     // 6. Import to Phase 2 fetcher
     await axios.post(
-      `${effectUrl}/d/${phase2DatasetId}/f/${phase2FetcherIndex}/import`,
+      `${effectUrl}/d/${_p2DatasetId}/f/${_p2FetcherIndex}/import`,
       new URLSearchParams({ csv: phase2Csv, delimiter: "," }).toString(),
       { headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded" } }
     );
 
-    res.json({ status: "ok", taskCount: songs.length, phase2DatasetId, phase2FetcherIndex });
+    res.json({ status: "ok", taskCount: songs.length, phase2DatasetId: _p2DatasetId, phase2FetcherIndex: _p2FetcherIndex });
   } catch (err) {
     const detail = err?.response?.data || err?.message || String(err);
     console.error("compileAndPostPhase2 error:", detail);
@@ -717,28 +1014,22 @@ app.post("/compileAndPostPhase2", async (req, res) => {
 
 // POST /downloadPhase2 — proxy the task-poster's result download as a CSV file
 app.post("/downloadPhase2", async (req, res) => {
-  const { authKey, datasetId, fetcherIndex } = req.body;
+  const { datasetId, fetcherIndex } = req.body;
+  const _datasetId    = datasetId    ?? EFFECT_PHASE2_DATASET_ID;
+  const _fetcherIndex = fetcherIndex ?? EFFECT_PHASE2_FETCHER_INDEX;
 
   const effectUrl = process.env.EFFECT_URL;
   if (!effectUrl) return res.status(500).json({ error: "EFFECT_URL not configured on server" });
-  if (!authKey || !datasetId || fetcherIndex === undefined) {
-    return res.status(400).json({ error: "authKey, datasetId, and fetcherIndex are required" });
+  if (!_datasetId || _fetcherIndex === null) {
+    return res.status(400).json({ error: "datasetId and fetcherIndex are required" });
   }
 
   try {
-    const authRes = await axios.post(
-      `${effectUrl}/auth`,
-      new URLSearchParams({ key: authKey }).toString(),
-      { headers: { "Content-Type": "application/x-www-form-urlencoded" }, maxRedirects: 5, validateStatus: s => s < 500 }
-    );
-    const setCookie = authRes.headers["set-cookie"];
-    if (!setCookie || !setCookie.length) {
-      return res.status(401).json({ error: "Effect AI auth failed — check authKey" });
-    }
-    const cookie = setCookie[0].split(";")[0];
+    const cookie = await getEffectCookie();
+    if (!cookie) return res.status(401).json({ error: "Effect AI auth failed — check EFFECT_AUTH_KEY server env var" });
 
     const dlRes = await axios.get(
-      `${effectUrl}/d/${datasetId}/f/${fetcherIndex}/download`,
+      `${effectUrl}/d/${_datasetId}/f/${_fetcherIndex}/download`,
       { headers: { Cookie: cookie }, responseType: "text", validateStatus: s => s < 500 }
     );
 
@@ -749,6 +1040,70 @@ app.post("/downloadPhase2", async (req, res) => {
     const detail = err?.response?.data || err?.message || String(err);
     console.error("downloadPhase2 error:", detail);
     res.status(500).json({ error: "Failed to download Phase 2 results", detail: String(detail) });
+  }
+});
+
+// POST /triggerScan — manually run the background Effect AI scanner immediately
+app.post("/triggerScan", async (_req, res) => {
+  try {
+    await scanEffectResults();
+    res.json({ status: "ok", message: "Scan complete — check server logs for details" });
+  } catch (err) {
+    res.status(500).json({ error: err?.message ?? String(err) });
+  }
+});
+
+// POST /debugPhase2Parse — inspect Phase 2 result format without side effects
+app.post("/debugPhase2Parse", async (req, res) => {
+  const { phase2DatasetId, phase2FetcherIndex } = req.body;
+  const _datasetId    = phase2DatasetId    ?? EFFECT_PHASE2_DATASET_ID;
+  const _fetcherIndex = phase2FetcherIndex ?? EFFECT_PHASE2_FETCHER_INDEX;
+
+  const effectUrl = process.env.EFFECT_URL;
+  if (!effectUrl) return res.status(500).json({ error: "EFFECT_URL not configured on server" });
+  if (!_datasetId || _fetcherIndex === null) {
+    return res.status(400).json({ error: "phase2DatasetId and phase2FetcherIndex are required" });
+  }
+
+  try {
+    const cookie = await getEffectCookie();
+    if (!cookie) return res.status(401).json({ error: "Effect AI auth failed — check EFFECT_AUTH_KEY server env var" });
+
+    const dlRes = await axios.get(
+      `${effectUrl}/d/${_datasetId}/f/${_fetcherIndex}/download`,
+      { headers: { Cookie: cookie }, responseType: "text", validateStatus: s => s < 500 }
+    );
+
+    const rawCsvPreview = dlRes.data?.slice(0, 1000) ?? "";
+    let parsedRows = [], parseError = null;
+    try {
+      parsedRows = csvParse(dlRes.data, { columns: true, skip_empty_lines: true, trim: true });
+    } catch (e) { parseError = e.message; }
+
+    const firstRow = parsedRows[0] ?? null;
+    let firstRowPayload = null, firstRowError = null;
+    if (firstRow) {
+      try {
+        const payload = JSON.parse(firstRow.result);
+        const answer = payload?.values?.answer;
+        const segs = answer?.verifiedLyrics ?? answer?.verifiedSegments ?? answer?.segments;
+        firstRowPayload = {
+          task: payload?.task,
+          answerKeys: Object.keys(answer ?? {}),
+          jobID: answer?.jobID,
+          hasVerifiedSegments: Array.isArray(answer?.verifiedSegments),
+          verifiedSegmentsLength: Array.isArray(answer?.verifiedSegments) ? answer.verifiedSegments.length : null,
+          hasSegments: Array.isArray(answer?.segments),
+          segmentsLength: Array.isArray(answer?.segments) ? answer.segments.length : null,
+          firstSegment: Array.isArray(segs) ? segs[0] : null,
+          willApply: Array.isArray(segs) && segs.length > 0,
+        };
+      } catch (e) { firstRowError = e.message; }
+    }
+
+    res.json({ rawCsvPreview, parseError, rowCount: parsedRows.length, firstRowPayload, firstRowError });
+  } catch (err) {
+    res.status(500).json({ error: err?.message ?? String(err) });
   }
 });
 
@@ -819,4 +1174,10 @@ wss.on("connection", (ws, req) => {
 
 server.listen(port, () => {
   console.log(`Server running on port ${port}`);
+  // Kick off Effect AI background scan every 1 minute
+  if (process.env.EFFECT_URL && EFFECT_AUTH_KEY) {
+    scanEffectResults(); // run once on startup
+    setInterval(scanEffectResults, 1 * 60 * 1000);
+    console.log("Effect AI background scanner started (1 min interval)");
+  }
 });

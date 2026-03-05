@@ -59,8 +59,12 @@ onMounted(() => {
   const stored = JSON.parse(localStorage.getItem("songHistory") || "[]");
   history.value = stored;
 
-  // Open WebSocket subscriptions for any jobs still pending (skip temp placeholders)
-  stored.filter(s => !s.lyrics && !s.jobID?.startsWith("pending-")).forEach(s => tryOpenWSForJob(s.jobID));
+  // Open WebSocket subscriptions for:
+  //  - jobs still pending lyrics
+  //  - jobs with Phase 1 lyrics but not yet Phase 2 validated lyrics
+  stored
+    .filter(s => !s.jobID?.startsWith("pending-") && (!s.lyrics || !s.validatedLyrics))
+    .forEach(s => tryOpenWSForJob(s.jobID));
 
   // Polling fallback in case WebSocket is unavailable
   pollInterval = setInterval(checkForLyrics, 5000);
@@ -192,9 +196,12 @@ function tryOpenWSForJob(jobID) {
       try {
         const msg = JSON.parse(ev.data);
         if (msg?.type === "lyrics_ready" && msg?.data) {
-          applyLyricsToHistory(jobID, msg.data.lyrics);
-          try { ws.close(); } catch {}
-          wsMap.delete(jobID);
+          applyLyricsToHistory(jobID, msg.data);
+          // Keep WS open until Phase 2 validated lyrics arrive
+          if (msg.data.validatedLyrics) {
+            try { ws.close(); } catch {}
+            wsMap.delete(jobID);
+          }
         }
       } catch (err) {
         console.warn("WS message parse error:", err);
@@ -223,7 +230,8 @@ async function checkForLyrics() {
   history.value = current;
 
   for (const entry of current) {
-    if (entry.lyrics || entry.jobID?.startsWith("pending-")) continue;
+    // Skip: temp placeholders, or songs fully validated (Phase 2 done)
+    if (entry.jobID?.startsWith("pending-") || (entry.lyrics && entry.validatedLyrics)) continue;
     try {
       const response = await fetch(`${apiUrl}/checkJob`, {
         method: "POST",
@@ -232,7 +240,16 @@ async function checkForLyrics() {
       });
       const result = await response.json();
       if (result.status === 200 && result.lyrics) {
-        applyLyricsToHistory(entry.jobID, result.lyrics);
+        applyLyricsToHistory(entry.jobID, result);
+      } else if (result.failed) {
+        // Nosana job never landed on-chain — mark failed so the retry button shows immediately
+        const songs = JSON.parse(localStorage.getItem("songHistory") || "[]");
+        const idx = songs.findIndex(s => s.jobID === entry.jobID);
+        if (idx !== -1 && !songs[idx].failed) {
+          songs[idx].failed = true;
+          localStorage.setItem("songHistory", JSON.stringify(songs));
+          history.value = songs;
+        }
       }
     } catch (err) {
       console.warn("checkForLyrics error:", err);
@@ -240,11 +257,17 @@ async function checkForLyrics() {
   }
 }
 
-function applyLyricsToHistory(jobID, lyrics) {
+function applyLyricsToHistory(jobID, data) {
   const songs = JSON.parse(localStorage.getItem("songHistory") || "[]");
   const idx = songs.findIndex(s => s.jobID === jobID);
   if (idx !== -1) {
-    songs[idx].lyrics = lyrics;
+    // data may be a plain lyrics string (legacy) or a song data object
+    if (typeof data === "string") {
+      songs[idx].lyrics = data;
+    } else {
+      if (data.lyrics) songs[idx].lyrics = data.lyrics;
+      if (data.validatedLyrics) songs[idx].validatedLyrics = data.validatedLyrics;
+    }
     localStorage.setItem("songHistory", JSON.stringify(songs));
     history.value = songs;
   }
